@@ -1,0 +1,106 @@
+# Builds SimpleOverlay.exe, tests it on Windows, then publishes a GitHub release
+# whenever VERSION changes in overlay.py.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "overlay.py"
+      - "tools/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LHM_VERSION: "0.9.6"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: v
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $m = Select-String -Path overlay.py -Pattern '^VERSION\s*=\s*"([^"]+)"'
+          $v = $m.Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          gh release view "v$v" --repo "${{ github.repository }}" 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release v$v already exists, nothing to do."
+            "exists=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "exists=false" >> $env:GITHUB_OUTPUT
+          }
+          exit 0
+
+      - uses: actions/setup-python@v5
+        if: steps.v.outputs.exists == 'false'
+        with:
+          python-version: "3.12"
+
+      - name: Sensor library (LibreHardwareMonitorLib)
+        if: steps.v.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          nuget install LibreHardwareMonitorLib -Version $env:LHM_VERSION -OutputDirectory pkgs -NonInteractive -Verbosity quiet
+          python tools/collect_lhm.py
+
+      - name: Bundled font (Inter)
+        if: steps.v.outputs.exists == 'false'
+        shell: pwsh
+        run: ./tools/get_fonts.ps1
+
+      - name: Build the exe
+        if: steps.v.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install psutil nvidia-ml-py certifi pythonnet pyinstaller
+          python -m PyInstaller --noconfirm --onefile --noconsole --name SimpleOverlay `
+            --add-data "lhm;lhm" --add-data "fonts;fonts" --collect-all pythonnet --collect-all clr_loader overlay.py
+
+      - name: Test the exe on Windows
+        if: steps.v.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          # PawnIO driver (same as on users' machines)
+          Invoke-WebRequest https://github.com/namazso/PawnIO.Setup/releases/download/2.2.0/PawnIO_setup.exe -OutFile PawnIO_setup.exe
+          Start-Process .\PawnIO_setup.exe -ArgumentList '-install','-silent' -Wait
+          # 1) sensor library, Tk and bundled font
+          Start-Process dist\SimpleOverlay.exe -ArgumentList '--selftest',"$PWD\selftest.txt" -Wait
+          Get-Content selftest.txt
+          if (-not (Select-String -Path selftest.txt -Pattern '^LOAD OK' -Quiet)) { throw "sensors: failed" }
+          if (-not (Select-String -Path selftest.txt -Pattern '^TK OK' -Quiet)) { throw "tkinter: failed" }
+          if (-not (Select-String -Path selftest.txt -Pattern '^FONT OK' -Quiet)) { throw "font: failed" }
+          # 2) setup (scheduled tasks), without starting the overlay
+          $p = Start-Process dist\SimpleOverlay.exe -ArgumentList '--setup','--no-start','--user',"$env:USERDOMAIN\$env:USERNAME" -Wait -PassThru
+          Get-Content "$env:USERPROFILE\.simpleoverlay.log" -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "setup: exit code $($p.ExitCode)" }
+          schtasks /query /tn "SimpleOverlay" | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "task SimpleOverlay missing" }
+          schtasks /query /tn "SimpleOverlay Startup" | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "task SimpleOverlay Startup missing" }
+          schtasks /delete /tn "SimpleOverlay" /f | Out-Null
+          schtasks /delete /tn "SimpleOverlay Startup" /f | Out-Null
+          exit 0
+
+      - name: Publish the release
+        if: steps.v.outputs.exists == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ steps.v.outputs.version }}"
+          gh release create "v$v" dist/SimpleOverlay.exe `
+            --repo "${{ github.repository }}" `
+            --target "${{ github.sha }}" `
+            --title "SimpleOverlay v$v" `
+            --notes "Update from the overlay (right-click > Check for updates) or download SimpleOverlay.exe below. First install: see the README."
