@@ -31,7 +31,7 @@ import urllib.request
 import psutil
 
 # Current version: bumping it makes the CI build and publish a new GitHub release
-VERSION = "1.7.2"
+VERSION = "1.8.0"
 REPO = "OgdenLeGrand/SimpleOverlay"
 EXE_NAME = "SimpleOverlay.exe"
 UPDATE_EVERY_MS = 6 * 60 * 60 * 1000
@@ -64,6 +64,7 @@ STRINGS = {
     "en": {
         "change_city": "Change city…",
         "refresh_weather": "Refresh weather",
+        "refresh_display": "Refresh display",
         "opacity": "Opacity",
         "autostart": "Start with Windows",
         "cpu_running": "Setting up…",
@@ -90,6 +91,7 @@ STRINGS = {
     "fr": {
         "change_city": "Changer de ville…",
         "refresh_weather": "Actualiser la météo",
+        "refresh_display": "Rafraîchir l'affichage",
         "opacity": "Opacité",
         "autostart": "Lancer au démarrage",
         "cpu_running": "Configuration en cours…",
@@ -122,18 +124,36 @@ def t(key, **kw):
 
 
 # ---------- crisp rendering on 125 %, 150 %… displays ----------
-def _init_dpi():
-    """Makes the process DPI aware (no blur) and returns the scale factor."""
+def _set_dpi_awareness():
+    """Per-monitor DPI awareness (v2): Windows never stretches the window (no blur), and
+    the real scale of the screen is always known, even if it changes after start-up."""
+    if not IS_WIN:
+        return
+    import ctypes
+    try:
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):  # PER_MONITOR_AWARE_V2
+            return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_set_dpi_awareness()
+FORCED_SCALE = os.environ.get("SIMPLEOVERLAY_SCALE")
+
+
+def system_scale():
     scale = 1.0
     if IS_WIN:
         import ctypes
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # system DPI aware
-        except Exception:
-            try:
-                ctypes.windll.user32.SetProcessDPIAware()
-            except Exception:
-                pass
         try:
             scale = ctypes.windll.user32.GetDpiForSystem() / 96
         except Exception:
@@ -143,14 +163,29 @@ def _init_dpi():
                 ctypes.windll.user32.ReleaseDC(0, hdc)
             except Exception:
                 pass
-    try:
-        scale = float(os.environ.get("SIMPLEOVERLAY_SCALE", scale))
-    except ValueError:
-        pass
+    if FORCED_SCALE:
+        try:
+            scale = float(FORCED_SCALE)
+        except ValueError:
+            pass
     return max(1.0, scale)
 
 
-SCALE = _init_dpi()
+def window_scale(widget):
+    """Scale of the screen the window is currently on (None if unknown)."""
+    if FORCED_SCALE or not IS_WIN:
+        return None
+    try:
+        import ctypes
+        u32 = ctypes.windll.user32
+        hwnd = u32.GetAncestor(widget.winfo_id(), 2)  # GA_ROOT
+        dpi = u32.GetDpiForWindow(hwnd)
+        return max(1.0, dpi / 96) if dpi else None
+    except Exception:
+        return None
+
+
+SCALE = system_scale()
 
 
 def sc(v):
@@ -205,6 +240,13 @@ LHEAD = 44        # header height (temperatures)
 LROW = 18         # height of a GPU / VRAM / CPU / RAM row
 LH = LPAD + LHEAD + 8 + LROW * 4 + 6
 W, H, PAD = sc(LW), sc(LH), sc(LPAD)
+
+
+def set_scale(scale):
+    """Changes the scale factor and recomputes the overlay dimensions."""
+    global SCALE, W, H, PAD
+    SCALE = scale
+    W, H, PAD = sc(LW), sc(LH), sc(LPAD)
 CITY_PX_MAX, CITY_PX_MIN = 11, 9   # city name size (pixels at 100 %)
 TEMP_PX_MAX, TEMP_PX_MIN = 15, 12  # header temperature size (pixels at 100 %)
 
@@ -747,6 +789,7 @@ class Overlay:
         self.q = queue.Queue()  # results from network threads -> UI thread
         self.picker = None
         self._picker_t = 0.0
+        self.city_full = self.cfg["city"]
         self.update = None     # (version, url) when an update is available
         self.updating = False
         self._wx_job = None
@@ -756,26 +799,49 @@ class Overlay:
 
         r = self.root = tk.Tk()
         r.title("SimpleOverlay")
-        # Font sizes (in points) follow the Windows scale
-        r.tk.call("tk", "scaling", SCALE * 96 / 72)
         global FONT
         if APP_FONT in tkfont.families(r):
             FONT = APP_FONT
         r.overrideredirect(True)
         r.attributes("-topmost", True)
         r.attributes("-alpha", self.cfg["alpha"])
-
-        # Keep the window on screen if the saved position is off-screen
-        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
-        x = min(max(0, int(self.cfg["x"])), sw - W)
-        y = min(max(0, int(self.cfg["y"])), sh - H)
-        r.geometry(f"{W}x{H}+{x}+{y}")
-
-        canvas_bg = BG
         if IS_WIN:
             r.config(bg=KEY)
             r.attributes("-transparentcolor", KEY)
-            canvas_bg = KEY
+        self.c = None
+        self.menu = None
+        self._wx_state = ("…", FG)
+        self._upd_label = None
+        self._pos = (int(self.cfg["x"]), int(self.cfg["y"]))
+        self.build_ui()
+        r.update_idletasks()
+        self.check_dpi()  # the screen may not use the system scale
+
+        psutil.cpu_percent(None)  # primes the non-blocking measurement
+        self.tick()
+        self.refresh_weather()
+        if FROZEN:
+            r.after(8000, self._update_loop)
+        r.after(3000, self._dpi_loop)
+        self._poll()
+
+    # --- user interface (rebuilt when the display scale changes) ---
+    def build_ui(self):
+        r = self.root
+        # Font sizes (in points) follow the display scale
+        r.tk.call("tk", "scaling", SCALE * 96 / 72)
+        self.close_picker(force=True)
+        if self.c is not None:
+            self.c.destroy()
+        if self.menu is not None:
+            self.menu.destroy()
+
+        # Keep the window on screen if the saved position is off-screen
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        x = min(max(0, self._pos[0]), sw - W)
+        y = min(max(0, self._pos[1]), sh - H)
+        r.geometry(f"{W}x{H}+{x}+{y}")
+        canvas_bg = KEY if IS_WIN else BG
 
         c = self.c = tk.Canvas(r, width=W, height=H, bg=canvas_bg, highlightthickness=0, bd=0)
         c.pack()
@@ -806,7 +872,6 @@ class Overlay:
         self.csub_txt = c.create_text(x_cpu + 1, y_sub, text="CPU", anchor="w", fill=MUTED, font=self.sub_font)
 
         self.wx_txt = c.create_text(W - PAD, y_big, text="…", anchor="e", fill=FG, font=f_big)
-        self.city_full = self.cfg["city"]
         self.city_txt = c.create_text(W - PAD, y_sub, text=self.city_full, anchor="e",
                                       fill=MUTED, font=self.city_font)
         self._fit_city()
@@ -845,6 +910,7 @@ class Overlay:
         m = self.menu = tk.Menu(r, **mkw)
         m.add_command(label=t("change_city"), command=self.pick_city)
         m.add_command(label=t("refresh_weather"), command=self.refresh_weather)
+        m.add_command(label=t("refresh_display"), command=self.refresh_display)
         op = tk.Menu(m, **mkw)
         for a in (1.0, 0.9, 0.75, 0.6, 0.45):
             op.add_command(label=f"{int(a * 100)}%", command=lambda a=a: self.set_alpha(a))
@@ -867,13 +933,36 @@ class Overlay:
         self.upd_idx = m.index("end")
         m.add_command(label=t("quit"), command=self.quit)
 
-        psutil.cpu_percent(None)  # primes the non-blocking measurement
+        # Restore the current state on the new widgets
         self._last = {}
-        self.tick()
-        self.refresh_weather()
-        if FROZEN:
-            r.after(8000, self._update_loop)
-        self._poll()
+        self._hw_label = None
+        self._text(self.wx_txt, *self._wx_state)
+        if self._upd_label:
+            self._set_upd_label(*self._upd_label)
+        if self.update:
+            c.itemconfig(self.dot, state="normal")
+
+    def refresh_display(self):
+        """Redraws the whole overlay at the current scale of its screen (fixes blur)."""
+        self._pos = (self.root.winfo_x(), self.root.winfo_y())
+        s = window_scale(self.root) or system_scale()
+        log(f"display refresh: scale {SCALE:g} -> {s:g}")
+        set_scale(s)
+        self.build_ui()
+        self.update_values()
+
+    def check_dpi(self):
+        s = window_scale(self.root)
+        if s and abs(s - SCALE) > 0.01:
+            log(f"display scale changed: {SCALE:g} -> {s:g}")
+            self._pos = (self.root.winfo_x(), self.root.winfo_y())
+            set_scale(s)
+            self.build_ui()
+            self.update_values()
+
+    def _dpi_loop(self):
+        self.check_dpi()
+        self.root.after(3000, self._dpi_loop)
 
     # --- drawing ---
     def _round_rect(self, x0, y0, x1, y1, rad, **kw):
@@ -973,6 +1062,10 @@ class Overlay:
 
     # --- loops ---
     def tick(self):
+        self.update_values()
+        self.root.after(STATS_EVERY_MS, self.tick)
+
+    def update_values(self):
         gt, u, vr = gpu_stats()
         if gt is None:
             gt = self.hw.gpu  # non-NVIDIA GPU: built-in sensors
@@ -997,7 +1090,6 @@ class Overlay:
         self._set_row("vram", vr, f"{vr:.0f}%" if vr is not None else "—", warn=85, hot=95)
         self._set_row("cpu", cpu, f"{cpu:.0f}%")
         self._set_row("ram", ram, f"{ram:.0f}%", warn=75, hot=90)
-        self.root.after(STATS_EVERY_MS, self.tick)
 
     def _poll(self):
         try:
@@ -1029,7 +1121,8 @@ class Overlay:
                 txt, ok = "—", False
 
             def done():
-                self._text(self.wx_txt, txt, FG if ok else MUTED)
+                self._wx_state = (txt, FG if ok else MUTED)
+                self._text(self.wx_txt, *self._wx_state)
                 self._wx_job = self.root.after(
                     WEATHER_EVERY_MS if ok else WEATHER_RETRY_MS, self.refresh_weather
                 )
@@ -1040,6 +1133,7 @@ class Overlay:
 
     # --- updates ---
     def _set_upd_label(self, text, enabled=True):
+        self._upd_label = (text, enabled)
         self.menu.entryconfig(self.upd_idx, label=text, state="normal" if enabled else "disabled")
 
     def _update_loop(self):
@@ -1143,7 +1237,9 @@ class Overlay:
 
     def _drag_end(self, _e):
         self.cfg["x"], self.cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
+        self._pos = (self.cfg["x"], self.cfg["y"])
         save_cfg(self.cfg)
+        self.check_dpi()  # moved to a screen with another scale?
 
     # --- menu / settings ---
     def _show_menu(self, e):
@@ -1247,7 +1343,8 @@ class Overlay:
             save_cfg(self.cfg)
             self.city_full = item["name"]
             self._fit_city()
-            self._text(self.wx_txt, "…", FG)
+            self._wx_state = ("…", FG)
+            self._text(self.wx_txt, *self._wx_state)
             self.refresh_weather()
             p.destroy()
 

@@ -80,7 +80,11 @@ jobs:
           if (-not (Select-String -Path selftest.txt -Pattern '^LOAD OK' -Quiet)) { throw "sensors: failed" }
           if (-not (Select-String -Path selftest.txt -Pattern '^TK OK' -Quiet)) { throw "tkinter: failed" }
           if (-not (Select-String -Path selftest.txt -Pattern '^FONT OK' -Quiet)) { throw "font: failed" }
-          # 2) setup (scheduled tasks), without starting the overlay
+          # 2) user interface from the sources (per-monitor DPI, display refresh)
+          python tools/ui_smoke.py "$PWD\ui.txt"
+          Get-Content ui.txt
+          if (-not (Select-String -Path ui.txt -Pattern '^UI OK' -Quiet)) { throw "ui: failed" }
+          # 3) setup (scheduled tasks), without starting the overlay
           $p = Start-Process dist\SimpleOverlay.exe -ArgumentList '--setup','--no-start','--user',"$env:USERDOMAIN\$env:USERNAME" -Wait -PassThru
           Get-Content "$env:USERPROFILE\.simpleoverlay.log" -ErrorAction SilentlyContinue
           if ($p.ExitCode -ne 0) { throw "setup: exit code $($p.ExitCode)" }

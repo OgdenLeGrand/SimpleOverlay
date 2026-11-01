@@ -36,7 +36,7 @@ You can also download `SimpleOverlay.exe` directly from the [latest release](htt
 |---|---|
 | Left-click and drag | Move the overlay |
 | Double-click the weather | Pick another city (the picker closes when you click elsewhere) |
-| Right-click | Menu: city, opacity, start with Windows, CPU temperature, updates, quit |
+| Right-click | Menu: city, refresh display, opacity, start with Windows, CPU temperature, updates, quit |
 
 GPU temperature, usage and VRAM are read through NVML on **NVIDIA** cards, and through the built-in sensors on other cards.
 
@@ -54,6 +54,8 @@ During installation, a single administrator approval:
 If the approval was declined: right-click the overlay → **Enable CPU temperature (admin)…**. The menu then shows *CPU temperature ✓*.
 
 ## Troubleshooting
+
+If the overlay ever looks blurry, right-click → **Refresh display** redraws it at the current scale of its screen (this also happens automatically when the scale changes, e.g. right after logon or when moving it to another monitor).
 
 Errors (weather, updates, CPU temperature) are logged to `%USERPROFILE%\.simpleoverlay.log`. Settings are stored in `%USERPROFILE%\.mini_overlay.json`.
 
