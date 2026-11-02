@@ -31,7 +31,7 @@ import urllib.request
 import psutil
 
 # Current version: bumping it makes the CI build and publish a new GitHub release
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 REPO = "OgdenLeGrand/SimpleOverlay"
 EXE_NAME = "SimpleOverlay.exe"
 UPDATE_EVERY_MS = 6 * 60 * 60 * 1000
@@ -171,6 +171,36 @@ def system_scale():
     return max(1.0, scale)
 
 
+def _root_hwnd(widget):
+    import ctypes
+    u32 = ctypes.windll.user32
+    u32.GetAncestor.restype = ctypes.c_void_p
+    u32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    return u32.GetAncestor(widget.winfo_id(), 2)  # GA_ROOT
+
+
+def ensure_topmost(widget):
+    """Puts the window back in the "always on top" band if it was dropped from it
+    (happens when it starts very early at logon). Never steals the focus.
+    Returns True when the window had to be fixed."""
+    if not IS_WIN:
+        return False
+    try:
+        import ctypes
+        u32 = ctypes.windll.user32
+        hwnd = _root_hwnd(widget)
+        u32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        if u32.GetWindowLongW(hwnd, -20) & 0x8:  # GWL_EXSTYLE & WS_EX_TOPMOST
+            return False
+        u32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        # HWND_TOPMOST, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+        u32.SetWindowPos(hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+        return True
+    except Exception:
+        return False
+
+
 def window_scale(widget):
     """Scale of the screen the window is currently on (None if unknown)."""
     if FORCED_SCALE or not IS_WIN:
@@ -178,7 +208,8 @@ def window_scale(widget):
     try:
         import ctypes
         u32 = ctypes.windll.user32
-        hwnd = u32.GetAncestor(widget.winfo_id(), 2)  # GA_ROOT
+        hwnd = _root_hwnd(widget)
+        u32.GetDpiForWindow.argtypes = [ctypes.c_void_p]
         dpi = u32.GetDpiForWindow(hwnd)
         return max(1.0, dpi / 96) if dpi else None
     except Exception:
@@ -823,6 +854,8 @@ class Overlay:
         if FROZEN:
             r.after(8000, self._update_loop)
         r.after(3000, self._dpi_loop)
+        self._topmost_fixes = 0
+        r.after(1000, self._topmost_loop)
         self._poll()
 
     # --- user interface (rebuilt when the display scale changes) ---
@@ -959,6 +992,13 @@ class Overlay:
             set_scale(s)
             self.build_ui()
             self.update_values()
+
+    def _topmost_loop(self):
+        if ensure_topmost(self.root):
+            self._topmost_fixes += 1
+            if self._topmost_fixes <= 5:
+                log("window was not on top anymore: restored")
+        self.root.after(2000, self._topmost_loop)
 
     def _dpi_loop(self):
         self.check_dpi()
