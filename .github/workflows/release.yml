@@ -92,6 +92,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "task SimpleOverlay missing" }
           schtasks /query /tn "SimpleOverlay Startup" | Out-Host
           if ($LASTEXITCODE -ne 0) { throw "task SimpleOverlay Startup missing" }
+          $xml = schtasks /query /tn "SimpleOverlay Startup" /xml | Out-String
+          if ($xml -notmatch '<Delay>PT20S</Delay>') { throw "start-up task: delay missing" }
           schtasks /delete /tn "SimpleOverlay" /f | Out-Null
           schtasks /delete /tn "SimpleOverlay Startup" /f | Out-Null
           exit 0

@@ -24,19 +24,19 @@ def check():
         lines.append(f"window_scale={s} SCALE={ov.SCALE} W={ov.W} H={ov.H} "
                      f"win={o.root.winfo_width()}x{o.root.winfo_height()} font={ov.FONT}")
         ok = s is not None and abs(s - ov.SCALE) < 0.01 and o.root.winfo_width() == ov.W
-        # always on top: drop the window out of the topmost band, it must come back
+        # always on top: must be OK now; then drop the window out of the topmost band,
+        # the check must detect it and put it back
         import ctypes
-        u32 = ctypes.windll.user32
+        u = ov._user32()
         hwnd = ov._root_hwnd(o.root)
-        u32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        u32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
-                                     ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-        u32.SetWindowPos(hwnd, ctypes.c_void_p(-2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)  # HWND_NOTOPMOST
-        dropped = not (u32.GetWindowLongW(hwnd, -20) & 0x8)
-        fixed = ov.ensure_topmost(o.root)
-        back = bool(u32.GetWindowLongW(hwnd, -20) & 0x8)
-        lines.append(f"topmost: dropped={dropped} fixed={fixed} back={back}")
-        ok = ok and dropped and fixed and back
+        before = ov.topmost_problem(o.root)
+        u.SetWindowPos(hwnd, ctypes.c_void_p(-2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)  # HWND_NOTOPMOST
+        problem = ov.ensure_topmost(o.root)
+        after = ov.topmost_problem(o.root)
+        o._reassert_topmost()
+        forced = ov.topmost_problem(o.root)
+        lines.append(f"topmost: before={before} problem={problem} after={after} forced={forced}")
+        ok = ok and before is None and bool(problem) and after is None and forced is None
         lines.append("UI OK" if ok else "UI FAIL")
     except Exception as ex:
         lines.append(f"UI FAIL {type(ex).__name__}: {ex}")

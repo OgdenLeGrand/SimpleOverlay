@@ -31,7 +31,7 @@ import urllib.request
 import psutil
 
 # Current version: bumping it makes the CI build and publish a new GitHub release
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 REPO = "OgdenLeGrand/SimpleOverlay"
 EXE_NAME = "SimpleOverlay.exe"
 UPDATE_EVERY_MS = 6 * 60 * 60 * 1000
@@ -171,34 +171,79 @@ def system_scale():
     return max(1.0, scale)
 
 
+_U32 = None
+
+
+def _user32():
+    """user32 with the prototypes used below (64-bit safe handles)."""
+    global _U32
+    if _U32 is None:
+        import ctypes
+        from ctypes import c_int, c_uint, c_void_p, c_wchar_p
+        u = ctypes.windll.user32
+        u.GetAncestor.restype = c_void_p
+        u.GetAncestor.argtypes = [c_void_p, c_uint]
+        u.GetWindow.restype = c_void_p
+        u.GetWindow.argtypes = [c_void_p, c_uint]
+        u.GetWindowLongW.argtypes = [c_void_p, c_int]
+        u.IsWindowVisible.argtypes = [c_void_p]
+        u.GetClassNameW.argtypes = [c_void_p, c_wchar_p, c_int]
+        u.GetDpiForWindow.argtypes = [c_void_p]
+        u.SetWindowPos.argtypes = [c_void_p, c_void_p, c_int, c_int, c_int, c_int, c_uint]
+        _U32 = u
+    return _U32
+
+
 def _root_hwnd(widget):
+    return _user32().GetAncestor(widget.winfo_id(), 2)  # GA_ROOT
+
+
+WS_EX_TOPMOST = 0x8
+_SWP_FLAGS = 0x0001 | 0x0002 | 0x0010  # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+
+
+def topmost_problem(widget):
+    """Returns None when the window is really on top, otherwise a short description:
+    either it lost its "always on top" state, or a normal window sits above it."""
+    if not IS_WIN:
+        return None
     import ctypes
-    u32 = ctypes.windll.user32
-    u32.GetAncestor.restype = ctypes.c_void_p
-    u32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-    return u32.GetAncestor(widget.winfo_id(), 2)  # GA_ROOT
+    u = _user32()
+    hwnd = _root_hwnd(widget)
+    if not u.GetWindowLongW(hwnd, -20) & WS_EX_TOPMOST:
+        return "lost its always-on-top state"
+    w, n = u.GetWindow(hwnd, 3), 0  # GW_HWNDPREV: windows above ours
+    while w and n < 2000:
+        if u.IsWindowVisible(w) and not u.GetWindowLongW(w, -20) & WS_EX_TOPMOST:
+            buf = ctypes.create_unicode_buffer(128)
+            u.GetClassNameW(w, buf, 128)
+            return f"normal window above it ({buf.value})"
+        w, n = u.GetWindow(w, 3), n + 1
+    return None
+
+
+def force_topmost(widget):
+    """Re-inserts the window at the top of the "always on top" band (off then on),
+    without taking the focus."""
+    if not IS_WIN:
+        return
+    import ctypes
+    u = _user32()
+    hwnd = _root_hwnd(widget)
+    u.SetWindowPos(hwnd, ctypes.c_void_p(-2), 0, 0, 0, 0, _SWP_FLAGS)  # HWND_NOTOPMOST
+    u.SetWindowPos(hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0, _SWP_FLAGS)  # HWND_TOPMOST
+    widget.attributes("-topmost", True)
 
 
 def ensure_topmost(widget):
-    """Puts the window back in the "always on top" band if it was dropped from it
-    (happens when it starts very early at logon). Never steals the focus.
-    Returns True when the window had to be fixed."""
-    if not IS_WIN:
-        return False
+    """Fixes the window when it is not really on top. Returns the problem found, or None."""
     try:
-        import ctypes
-        u32 = ctypes.windll.user32
-        hwnd = _root_hwnd(widget)
-        u32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        if u32.GetWindowLongW(hwnd, -20) & 0x8:  # GWL_EXSTYLE & WS_EX_TOPMOST
-            return False
-        u32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
-                                     ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-        # HWND_TOPMOST, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
-        u32.SetWindowPos(hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
-        return True
-    except Exception:
-        return False
+        problem = topmost_problem(widget)
+        if problem:
+            force_topmost(widget)
+        return problem
+    except Exception as ex:
+        return f"check failed: {type(ex).__name__}: {ex}"
 
 
 def window_scale(widget):
@@ -206,11 +251,7 @@ def window_scale(widget):
     if FORCED_SCALE or not IS_WIN:
         return None
     try:
-        import ctypes
-        u32 = ctypes.windll.user32
-        hwnd = _root_hwnd(widget)
-        u32.GetDpiForWindow.argtypes = [ctypes.c_void_p]
-        dpi = u32.GetDpiForWindow(hwnd)
+        dpi = _user32().GetDpiForWindow(_root_hwnd(widget))
         return max(1.0, dpi / 96) if dpi else None
     except Exception:
         return None
@@ -619,6 +660,7 @@ $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowS
      -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -Priority 5
 Register-ScheduledTask -TaskName {q(TASK_RUN)} -Action $a -Principal $p -Settings $s -Force | Out-Null
 $t = New-ScheduledTaskTrigger -AtLogOn -User {q(user)}
+$t.Delay = 'PT20S'  # start once the desktop is fully ready (keeps "always on top" reliable)
 Register-ScheduledTask -TaskName {q(TASK_LOGON)} -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null
 """
     r = _run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], timeout=120)
@@ -855,7 +897,13 @@ class Overlay:
             r.after(8000, self._update_loop)
         r.after(3000, self._dpi_loop)
         self._topmost_fixes = 0
+        self._menu_open = False
         r.after(1000, self._topmost_loop)
+        # Right after logon the desktop is still starting: re-assert "on top" a few times
+        for delay in (3, 10, 30, 60, 120):
+            r.after(delay * 1000, self._reassert_topmost)
+        if self.task_mode and is_admin() and self.cfg.get("tasks_version") != 2:
+            threading.Thread(target=self._upgrade_tasks, daemon=True).start()
         self._poll()
 
     # --- user interface (rebuilt when the display scale changes) ---
@@ -983,6 +1031,7 @@ class Overlay:
         set_scale(s)
         self.build_ui()
         self.update_values()
+        self._reassert_topmost()
 
     def check_dpi(self):
         s = window_scale(self.root)
@@ -993,12 +1042,34 @@ class Overlay:
             self.build_ui()
             self.update_values()
 
+    def _busy(self):
+        """True while our own menu or city picker is open (must stay above the overlay)."""
+        return self._menu_open or (self.picker is not None and self.picker.winfo_exists())
+
     def _topmost_loop(self):
-        if ensure_topmost(self.root):
-            self._topmost_fixes += 1
-            if self._topmost_fixes <= 5:
-                log("window was not on top anymore: restored")
+        if not self._busy():
+            problem = ensure_topmost(self.root)
+            if problem:
+                self._topmost_fixes += 1
+                if self._topmost_fixes <= 10:
+                    log(f"not on top ({problem}): restored")
         self.root.after(2000, self._topmost_loop)
+
+    def _reassert_topmost(self):
+        if not self._busy():
+            try:
+                force_topmost(self.root)
+            except Exception as ex:
+                log(f"force on top: {type(ex).__name__}: {ex}")
+
+    def _upgrade_tasks(self):
+        """Existing installs: recreate the scheduled tasks with the start-up delay."""
+        try:
+            register_tasks(sys.executable, current_user())
+            self.cfg["tasks_version"] = 2
+            save_cfg(self.cfg)
+        except Exception as ex:
+            log(f"task upgrade: {type(ex).__name__}: {ex}")
 
     def _dpi_loop(self):
         self.check_dpi()
@@ -1283,10 +1354,12 @@ class Overlay:
 
     # --- menu / settings ---
     def _show_menu(self, e):
+        self._menu_open = True
         try:
             self.menu.tk_popup(e.x_root, e.y_root)
         finally:
             self.menu.grab_release()
+            self.root.after(300, lambda: setattr(self, "_menu_open", False))
 
     def set_alpha(self, a):
         self.cfg["alpha"] = a
